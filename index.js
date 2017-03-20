@@ -3,10 +3,10 @@ const Promise = require('bluebird');
 const _ = require('lodash');
 const request = require('request');
 const Slack = require('slack-node');
-const config = {};
+let config = {};
 
 try {
-    config = require('./config.json');
+    config = require('./config.js');
 }
 catch (e) { }
 
@@ -19,7 +19,7 @@ let errors = 0;
 
 const webhookUri = process.env.WEBHOOK_URL || config.WEBHOOK_URL;
 const channel = process.env.CHANNEL || config.CHANNEL;
-var slack = new Slack();
+const slack = new Slack();
 slack.setWebhook(webhookUri);
 
 var failedUrls = [];
@@ -58,10 +58,8 @@ var getDomain = function (doc) {
 
 var checkUrls = function (urls) {
     all = urls.length;
-
     var requestAsync = Promise.promisify(request);
-    urls = _.map(urls, function (url) { return 'http://' + url.trim(); })
-    Promise.map(urls, function (url) {
+    Promise.map(urls, (url) => {
         return requestAsync(url)
             .then(function (res) {
                 res.body = null;
@@ -72,39 +70,62 @@ var checkUrls = function (urls) {
                 //console.log(url + ' request ERROR: ' + JSON.stringify(err, null, 2));
                 failedUrls.push(url);
             });
-    }, { concurrency: 10 }).all().then(function (results) {
+    }, { concurrency: 10 }).all().then((results) => {
         console.log('all done');
-        failedUrls.length && notifySlack('***** Site Checker - Start *****');
-        _.each(failedUrls, function(url) {
-            notifySlack(url + ' is DOWN!')
-        });
-        failedUrls.length && notifySlack('***** Site Checker - End *****');
+        let msg = '';
+        if (failedUrls.length) {
+            msg += '***** Site Checker - Start *****\r\n';
+            _.forEach(failedUrls, (url) => {
+                msg += url + ' is DOWN!\r\n';
+            });
+            msg += '***** Site Checker - End *****\r\n';
+            notifySlack(msg);
+        }
         database.close();
     });
 
 }
 
-const getUrlsFromDatabase = function (db) {
-    var selection = {
+const prefixes = ['backoffice'] //, 'analytics', 'cms', 'stellarbridge', 'sitesbuilder', 'plugins', 'api'];
+
+const getUrlsFromDatabase = (db) => {
+    var websites = db.collection('websites');
+    const websitesSel = {
         isPublished: true,
         is_deleted: { $ne: true },
         isTemplate: { $ne: true },
         'settings.business_unit_id': { $ne: null }
-    }
-    var projection = {
+    };
+    const websitesProj = {
         'settings.domains': 1,
         _id: 0
-    }
-    var websites = db.collection('websites')
-    websites.find(selection, projection)
+    };
+    const context = {};
+    websites.find(websitesSel, websitesProj)
         .toArray()
-        .then(function (docs) {
-            docs = _.filter(_.flatMap(docs, getDomain), function (url) { return !!url; });
-            checkUrls(docs)
-            return docs;
+        .then((docs) => {
+            docs = _.filter(_.flatMap(docs, getDomain), (url) => !!url);
+            context.siteUrls = _.map(docs, (url) => 'http://' + url.trim());
         })
-        .catch(function (err) {
-            console.log('Error while retreiving URLs from database: ' + JSON.stringify(err, null, 2))
+        .then(() => {
+            const operations = db.collection('operations');
+            return operations.find({}, { domain: 1, _id: 0 }).toArray();
+        })
+        .then((domains) => {
+            context.appUrls = [];
+            _.forEach(domains, (x) => {
+                _.forEach(prefixes, (prefix) => {
+                    context.appUrls.push(`https://${prefix}.${x.domain}`);
+                });
+            });
+        })
+        .then(() => {
+            let urls = context.siteUrls;
+            urls = urls.concat(context.appUrls);
+            checkUrls(urls);
+        })
+        .catch((err) => {
+            console.log('Error while retreiving URLs from database: ' + JSON.stringify(err, null, 2));
         });
 }
 
